@@ -101,6 +101,11 @@ type PcmSpeaker struct {
 	duckTarget atomic.Int32
 	mixer      Mixer
 
+	// muted is the speaker mute (HA's media player mute), set from the
+	// control plane; outMute applies it on the ALSA goroutine. See outmute.go.
+	muted   atomic.Bool
+	outMute outputMute
+
 	// chain is the output chain (EQ, bass guard, limiter), run on the MIX,
 	// after the duck and before the taps and the DAC. Inactive until the
 	// controller says it has stopped processing (SetOutputChainActive), so
@@ -415,6 +420,19 @@ func (p *PcmSpeaker) silenceLoop() {
 			}
 		}
 
+		// Speaker mute, after the chain so its filter state runs on and
+		// unmuting does not restart it, and before the taps so the AEC
+		// reference and the meter see what the speaker actually emits.
+		muted := p.muted.Load()
+		if o := p.outMute.apply(out, muted, !process); o != nil {
+			out = o
+		} else {
+			out = silencePeriod
+		}
+		if muted {
+			level = 0
+		}
+
 		// Taps see the MIXED output, which is what the speaker actually
 		// emits. That matters for AEC: the far-end reference is what needs
 		// cancelling from the mic, and with music playing under a response
@@ -528,6 +546,16 @@ func (p *PcmSpeaker) PumpMusic(data []byte) error {
 func (p *PcmSpeaker) SetDuck(db float64) {
 	p.duckTarget.Store(DuckGain(db))
 }
+
+// SetMuted mutes or unmutes the speaker. Both planes keep playing silently,
+// so unmuting resumes wherever the audio has got to. Returns whether the
+// state changed.
+func (p *PcmSpeaker) SetMuted(on bool) bool {
+	return p.muted.Swap(on) != on
+}
+
+// Muted reports the speaker mute.
+func (p *PcmSpeaker) Muted() bool { return p.muted.Load() }
 
 // SetOutputChain sets the output chain's configuration; it lands on the next
 // period, keeping filter and limiter state, so a change mid-song is heard

@@ -117,6 +117,8 @@ type ControlClient struct {
 	speakerFlushCallback  StateCallback
 	musicFlushCallback    StateCallback
 	duckCallback          func(on bool)
+	muteSetCallback       func(on bool)
+	speakerMuteCallback   func(on bool)
 	wifiChangeCallback    WifiChangeCallback
 	wifiCommitCallback    StateCallback
 	wifiScanCallback      StateCallback
@@ -171,6 +173,8 @@ func (c *ControlClient) OnBeamLock(cb BeamLockCallback)           { c.beamLockCa
 func (c *ControlClient) OnSpeakerFlush(cb StateCallback)          { c.speakerFlushCallback = cb }
 func (c *ControlClient) OnMusicFlush(cb StateCallback)            { c.musicFlushCallback = cb }
 func (c *ControlClient) OnDuck(cb func(on bool))                  { c.duckCallback = cb }
+func (c *ControlClient) OnMuteSet(cb func(on bool))               { c.muteSetCallback = cb }
+func (c *ControlClient) OnSpeakerMuteSet(cb func(on bool))        { c.speakerMuteCallback = cb }
 func (c *ControlClient) OnWifiChange(cb WifiChangeCallback)       { c.wifiChangeCallback = cb }
 func (c *ControlClient) OnWifiCommit(cb StateCallback)            { c.wifiCommitCallback = cb }
 func (c *ControlClient) OnWifiScan(cb StateCallback)              { c.wifiScanCallback = cb }
@@ -727,6 +731,25 @@ func (c *ControlClient) connect(ctx context.Context, server *discovery.ServerInf
 				c.volumeSetCallback(msg.Level)
 			}
 
+		case "mute_set":
+			// Home Assistant's mic mute. VIRTUAL, and separate from the
+			// button's: it can clear only what it set — see muteController.
+			var msg struct {
+				Muted bool `json:"muted"`
+			}
+			if err := json.Unmarshal(raw, &msg); err == nil && c.muteSetCallback != nil {
+				c.muteSetCallback(msg.Muted)
+			}
+
+		case "speaker_mute_set":
+			// Home Assistant's media player mute — see speaker/outmute.go.
+			var msg struct {
+				Muted bool `json:"muted"`
+			}
+			if err := json.Unmarshal(raw, &msg); err == nil && c.speakerMuteCallback != nil {
+				c.speakerMuteCallback(msg.Muted)
+			}
+
 		case "config":
 			var msg config.ConfigMessage
 			if err := json.Unmarshal(raw, &msg); err == nil {
@@ -1120,9 +1143,17 @@ func capabilities() []string {
 	// the controller's ack carries the same feature, which is the controller
 	// saying it has stopped: either half alone keeps the old path, and both
 	// together must never process the same audio twice.
+	//
+	// "remote_mute": this firmware takes mute_set, Home Assistant's virtual
+	// mic mute, and reports it as remoteMuted on mute_state.
+	//
+	// "speaker_mute": this firmware takes speaker_mute_set and reports
+	// speaker_mute_state. Without it the media player's mute must not be
+	// offered, since nothing would act on it.
 	caps := []string{"mic", "speaker", "leds", "led_anim", "buttons",
 		"oww_shadow", "oww_trigger", "button_hold", "audio_mix",
-		"aec_hw_ref", "oww_local_only", "output_chain"}
+		"aec_hw_ref", "oww_local_only", "output_chain",
+		"remote_mute", "speaker_mute"}
 	if als.Present() {
 		caps = append(caps, "ambient_light")
 	}
@@ -1153,11 +1184,23 @@ func (c *ControlClient) SendButton(event buttons.ButtonClickEvent) {
 	}
 }
 
-// SendMuteState notifies the controller of the current mute state.
+// SendMuteState notifies the controller of the current mute state. muted is
+// the EFFECTIVE state — button or remote — so a controller that predates the
+// remote mute still treats a remotely muted device as muted; remoteMuted is
+// the remote flag alone.
 // Safe for concurrent use — silently drops if not connected.
-func (c *ControlClient) SendMuteState(muted bool) {
+func (c *ControlClient) SendMuteState(muted, remoteMuted bool) {
 	_ = c.writeJSON(map[string]interface{}{
-		"type":  "mute_state",
+		"type":        "mute_state",
+		"muted":       muted,
+		"remoteMuted": remoteMuted,
+	})
+}
+
+// SendSpeakerMuteState reports the speaker mute.
+func (c *ControlClient) SendSpeakerMuteState(muted bool) {
+	_ = c.writeJSON(map[string]interface{}{
+		"type":  "speaker_mute_state",
 		"muted": muted,
 	})
 }

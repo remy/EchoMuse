@@ -136,6 +136,9 @@ func main() {
 	// the controller's duck message (OnDuck below).
 	localDuck = speaker.NewLocalDuck(pcmSpeaker.SetDuck, speaker.LocalDuckHold)
 
+	// Set once the control client exists, for the volume button below.
+	var ctlPtr atomic.Pointer[client.ControlClient]
+
 	buttonController.SetVolumeCallback(func(direction string) {
 		// Inert without a controller: nothing is playing to be louder or
 		// quieter, and showing the arc would acknowledge a device that
@@ -143,6 +146,14 @@ func main() {
 		if s.LinkDown() {
 			log.Println("[cmd] volume button ignored — no controller session")
 			return
+		}
+		// A press on a muted speaker unmutes it: someone at the device wants
+		// to hear it, and nothing on the device shows the mute.
+		if pcmSpeaker.SetMuted(false) {
+			log.Println("[cmd] speaker unmuted by volume button")
+			if c := ctlPtr.Load(); c != nil {
+				c.SendSpeakerMuteState(false)
+			}
 		}
 		if direction == "up" {
 			s.VolumeStepUp()
@@ -211,6 +222,7 @@ func main() {
 			dataClient.StopMic()
 		},
 	)
+	ctlPtr.Store(controlClient)
 
 	// Private-listening sessions (docs/listening.md). The gate ignores any id
 	// that is not the open session, so a late message cannot touch a new one.
@@ -423,7 +435,8 @@ func main() {
 		// On a fresh boot the config push seeds the volume, and Set()'s
 		// change callback sends the report instead.
 		muted := s.IsMuted()
-		controlClient.SendMuteState(muted)
+		controlClient.SendMuteState(muted, s.IsRemoteMuted())
+		controlClient.SendSpeakerMuteState(pcmSpeaker.Muted())
 		// The features just arrived on the ack, and a restarted controller
 		// has no record of what this device is doing — so resolve and report
 		// unconditionally.
@@ -582,7 +595,7 @@ func main() {
 	// dump to confirm the sibling mute controls before touching them (see
 	// review C5 fix sequence) — deliberately not guessed at here.
 	s.SetMuteChangeCallback(func(muted bool) {
-		controlClient.SendMuteState(muted)
+		controlClient.SendMuteState(muted, s.IsRemoteMuted())
 		if muted {
 			// Reported as muted rather than as the stream stopping, which
 			// StopMic would otherwise record.
@@ -624,6 +637,29 @@ func main() {
 	// callback above — so SendVolumeState fires automatically, closing the loop.
 	controlClient.OnVolumeSet(func(level int) {
 		s.SetVolume(level)
+	})
+
+	// Home Assistant's mic mute switch. Virtual: it stops the stream and
+	// paints the ring through the same change callback as the button, but
+	// cannot clear a mute set at the button — see muteController.SetRemote.
+	controlClient.OnMuteSet(func(on bool) {
+		// A change is reported by the mute callback. A no-op still gets an
+		// answer: HA shows the switch from our report, and turning it off on
+		// a device muted at the button must read back as still muted.
+		if !s.SetRemoteMuted(on) {
+			controlClient.SendMuteState(s.IsMuted(), s.IsRemoteMuted())
+		}
+	})
+
+	// Home Assistant's media player mute. Not persisted, unlike the mic: a
+	// speaker that stays silent across a reboot with nothing on the device
+	// showing why reads as broken, and the failure that matters for privacy
+	// is the mic's, not this one.
+	controlClient.OnSpeakerMuteSet(func(on bool) {
+		if pcmSpeaker.SetMuted(on) {
+			log.Printf("[cmd] speaker %s by controller", map[bool]string{true: "muted", false: "unmuted"}[on])
+		}
+		controlClient.SendSpeakerMuteState(pcmSpeaker.Muted())
 	})
 
 	// Heap-profile dump on SIGUSR1 — the ~1MB/h leak hunt (2026-07-17).

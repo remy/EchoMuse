@@ -334,3 +334,44 @@ def test_private_listening_is_negotiated_in_both_directions():
     assert f'"{em_listen.CAPABILITY}" in (self.capabilities' in py
     assert em_listen.CAPABILITY in device_capabilities()
     assert re.search(r'FeatureListenSession\s*=\s*"listen_session"', CONTROL_GO.read_text())
+
+
+def test_mute_controls_are_offered_only_to_firmware_that_acts_on_them():
+    """
+    HA's mic switch and media player mute each send a message the device must
+    handle. Offered to firmware without the handler, they are controls that
+    silently do nothing — which the media player mute was: VOLUME_MUTE was
+    advertised unconditionally with `muted` hardcoded False and MUTE/UNMUTE
+    falling through to "unhandled".
+    """
+    src = ESPHOME.read_text()
+    go = CONTROL_GO.read_text()
+    caps = device_capabilities()
+
+    base = src[src.index("MEDIA_PLAYER_FEATURES = int("):]
+    base = base[:base.index("\n)\n")]
+    assert "VOLUME_MUTE" not in base, \
+        "VOLUME_MUTE must be added per device, gated on speaker_mute"
+    assert re.search(r'if self\._speaker_mute_capable:\s*\n\s*flags \|= MEDIA_PLAYER_MUTE_FEATURE', src)
+    assert "muted=False" not in src, \
+        "MediaPlayerStateResponse must report the device's speaker mute"
+    assert re.search(r'if self\._remote_mute_capable:\s*\n\s*yield api_pb2\.ListEntitiesSwitchResponse', src)
+
+    # Each message the controller sends is one the device handles, and each
+    # report the device sends is one the controller reads.
+    ctl = CONTROLLER.read_text()
+    for cap, sent, report in (("remote_mute", "mute_set", "mute_state"),
+                              ("speaker_mute", "speaker_mute_set", "speaker_mute_state")):
+        assert cap in caps
+        assert f'"type": "{sent}"' in ctl
+        assert f'case "{sent}":' in go
+        assert f'"type":  "{report}"' in go or f'"type":        "{report}"' in go
+        assert f'msg_type == "{report}"' in ctl
+
+
+def test_the_mic_mute_entity_key_is_new():
+    """Entity keys are append-only: HA keys its registry on them."""
+    src = ESPHOME.read_text()
+    keys = dict(re.findall(r'^([A-Z_]+_KEY)\s*=\s*(\d+)', src, re.M))
+    assert keys["MIC_MUTE_KEY"] == "4"
+    assert len(set(keys.values())) == len(keys), f"duplicate entity keys: {keys}"

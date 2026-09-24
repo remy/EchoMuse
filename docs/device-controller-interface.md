@@ -68,7 +68,7 @@ informational: the controller stores and displays them, and gates Android-only
 payloads on `base_os`. The kernel pair is omitted if `uname` fails. A device
 for a new board should send all of them.
 
-`capabilities` is the negotiation signal. The Dot announces twelve unconditionally
+`capabilities` is the negotiation signal. The Dot announces fourteen unconditionally
 plus one conditional (`capabilities()` in `control.go`):
 
 | Capability | Condition | Meaning |
@@ -85,6 +85,8 @@ plus one conditional (`capabilities()` in `control.go`):
 | `oww_local_only` | always | Can listen **privately**: score its own wake word and send nothing until it fires. Whether it is doing so is `listen_state` — see [listening.md](listening.md) |
 | `aec_hw_ref` | always | Can take the AEC far-end reference from a playback loopback in the mic capture itself, and falls back to the software tap at the ALSA write when the board has none |
 | `output_chain` | always | Can run the speaker output chain (EQ → bass guard → limiter) itself, at the ALSA write, from the config keys `eqBands`, `eqLoudness`, `limiter*`, `bassGuard*`. Runs it only when the controller's `ack` carries `output_chain` too, which is the controller saying it has stopped processing: either half alone keeps the old path, so audio is never shaped twice |
+| `remote_mute` | always | Takes `mute_set`, Home Assistant's **virtual** mic mute: stops the mic stream and paints the red ring, but leaves the ADC and button LED alone and can never clear a mute set at the button. Reported as `remoteMuted` on `mute_state` |
+| `speaker_mute` | always | Takes `speaker_mute_set` and reports `speaker_mute_state`. Gates the HA media player's mute |
 | `ambient_light` | only if the sensor is actually readable (`als.Present()`) | Reports light readings |
 
 **`aec_hw_ref` is a capability with a runtime companion, and both are needed.**
@@ -135,7 +137,8 @@ absent optional fields take prior/default behaviour.
 |--------|---------|---------|
 | `register` | see above | Handshake, sent once at connect |
 | `button` | `clickType`, `down`, `heldMs`, `muted`, `button.type` | Button press/release; `heldMs` only if `button_hold` |
-| `mute_state` | `muted` | Mute toggled (mute is device-sovereign — see `device/CLAUDE.md`) |
+| `mute_state` | `muted`, `remoteMuted?` | Mute changed. `muted` is the EFFECTIVE state (button or remote); `remoteMuted` is HA's virtual mute alone, absent on firmware without `remote_mute`. The button's mute is device-sovereign — see `device/CLAUDE.md` |
+| `speaker_mute_state` | `muted` | Speaker mute changed, and on every connect (only if `speaker_mute`) |
 | `volume_state` | `level` | Volume changed; controller persists it as `startupVolume` |
 | `oww_shadow_cross` | score/threshold/age fields | Shadow-mode wake crossing (report only) |
 | `oww_wake` | `score`, `threshold`, `ageMs`, `capturedMono`; under private listening also `session`, `floor`, `barge` | On-device trigger fired (`owwOnDevice=on`). With `session` it opened a private-listening session whose audio follows as `0x07` ([listening.md](listening.md)); without, it lands in `Device.pending_wake` and the continuous stream carries the audio |
@@ -160,6 +163,8 @@ absent optional fields take prior/default behaviour.
 | `listen_close` | `session`, `reason` | End that session. Ignored if it is not the open one |
 | `beam_lock` / `beam_unlock` | — | Lock beamformer to the chosen perimeter mic for a turn / return to omni |
 | `volume_set` | `level` | Set absolute volume |
+| `mute_set` | `muted` | Set HA's virtual mic mute (only if `remote_mute`). Clears only itself; always answered with `mute_state` |
+| `speaker_mute_set` | `muted` | Mute the speaker (only if `speaker_mute`). Always answered with `speaker_mute_state` |
 | `duck` | `on` | Duck music under a voice turn (turn start/end) |
 | `config` | `ConfigMessage` fields | Push configuration (see below) |
 | `wifi_scan` | — | Scan for networks; answered with `wifi_scan_result` |

@@ -10,8 +10,16 @@ import (
 )
 
 type muteController struct {
-	mu      sync.Mutex
-	muted   bool
+	mu    sync.Mutex
+	muted bool // the physical button's mute: ADC muted, button LED lit
+	// remote is Home Assistant's mute, and it is VIRTUAL: the mic stream is
+	// stopped and the ring shows red, but the ADC and the button LED are left
+	// alone. It exists so HA can take the mic back as well as give it up
+	// without being able to undo the physical button — a remote unmute
+	// clears only this flag, so a device muted at the button stays muted.
+	// Everything that asks IsMuted() sees the OR of the two, which is what
+	// keeps mic_start refused, wakes suppressed and the ring red.
+	remote  bool
 	ledCtrl func() led.Controller
 	// dotMuted is set externally to block dot button events while muted
 	onMuteChange func(muted bool)
@@ -40,15 +48,38 @@ func (m *muteController) SetOnMuteChange(cb func(muted bool)) {
 	m.mu.Unlock()
 }
 
+// IsMuted is the effective state: muted at the button OR from HA.
 func (m *muteController) IsMuted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.muted || m.remote
+}
+
+// IsHardwareMuted is the physical button's mute alone.
+func (m *muteController) IsHardwareMuted() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.muted
 }
 
+// IsRemoteMuted is HA's virtual mute alone.
+func (m *muteController) IsRemoteMuted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.remote
+}
+
+// Toggle is the physical button. A press on a device muted either way opens
+// the mic and clears BOTH mutes: the ring is red whichever set it, and the
+// person pressing the button at the device outranks Home Assistant. A press
+// on an open mic is the hardware mute.
 func (m *muteController) Toggle() {
 	m.mu.Lock()
-	m.muted = !m.muted
+	if m.muted || m.remote {
+		m.muted, m.remote = false, false
+	} else {
+		m.muted = true
+	}
 	muted := m.muted
 	// Copy under the lock — SetOnMuteChange writes this field under mu from
 	// the main goroutine, and button events can fire before that wiring
@@ -69,6 +100,52 @@ func (m *muteController) Toggle() {
 	if cb != nil {
 		cb(muted)
 	}
+}
+
+// SetRemote sets HA's virtual mute. It never touches the hardware mute, so a
+// remote unmute on a device muted at the button changes nothing the person at
+// the device can see. The change callback fires on every change of the flag,
+// not only of the effective state, because the controller reports the flag
+// itself to HA; its handler is idempotent in the effective state. Returns
+// whether the flag changed, so the caller can answer a no-op itself.
+func (m *muteController) SetRemote(on bool) bool {
+	m.mu.Lock()
+	if m.remote == on {
+		m.mu.Unlock()
+		return false
+	}
+	before := m.muted || m.remote
+	m.remote = on
+	after := m.muted || m.remote
+	cb := m.onMuteChange
+	persist := m.persist
+	m.mu.Unlock()
+
+	if after != before {
+		if after {
+			log.Println("Mute: mic muted remotely")
+			m.showMuteLEDs()
+		} else {
+			log.Println("Mute: mic unmuted remotely")
+			m.clearLEDs()
+		}
+	}
+	if persist != nil {
+		persist()
+	}
+	if cb != nil {
+		cb(after)
+	}
+	return true
+}
+
+// RestoreRemoteMuted re-applies a persisted remote mute at boot. Flag only:
+// the mute is virtual, and the ring is painted with the LED init.
+func (m *muteController) RestoreRemoteMuted() {
+	m.mu.Lock()
+	m.remote = true
+	m.mu.Unlock()
+	log.Println("Mute: restoring persisted remote mute")
 }
 
 // adcMuteCtls are the per-chip ADC mute controls, all four codecs

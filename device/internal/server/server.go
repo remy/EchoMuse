@@ -106,11 +106,19 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 	// Restore persisted mute state before the persist hook is wired, so the
 	// restore itself doesn't rewrite the file. Mute is device-sovereign —
 	// it must come back with or without a controller.
-	if st, ok := loadDeviceState(statePath); ok && st.Muted {
-		server.mute.RestoreMuted() // ADC only; LEDs painted after init below
+	if st, ok := loadDeviceState(statePath); ok {
+		if st.Muted {
+			server.mute.RestoreMuted() // ADC only; LEDs painted after init below
+		}
+		if st.RemoteMuted {
+			server.mute.RestoreRemoteMuted()
+		}
 	}
 	server.mute.persist = func() {
-		saveDeviceState(statePath, deviceState{Muted: server.mute.IsMuted()})
+		saveDeviceState(statePath, deviceState{
+			Muted:       server.mute.IsHardwareMuted(),
+			RemoteMuted: server.mute.IsRemoteMuted(),
+		})
 	}
 
 	go func() {
@@ -144,9 +152,11 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 
 		// A muted state restored from state.json was applied to the ADC
 		// before the LED hardware was ready — paint the red ring and
-		// button LED now.
+		// button LED now. The button LED is the hardware mute's alone.
 		if server.mute.IsMuted() {
 			server.mute.showMuteLEDs()
+		}
+		if server.mute.IsHardwareMuted() {
 			setMuteButtonLED(true)
 		}
 	}()
@@ -219,9 +229,20 @@ func (s *Server) SetMuteChangeCallback(cb func(muted bool)) {
 	s.mute.SetOnMuteChange(cb)
 }
 
-// IsMuted returns true when the mic is muted — used to block dot button.
+// IsMuted returns true when the mic is muted at the button or remotely.
 func (s *Server) IsMuted() bool {
 	return s.mute.IsMuted()
+}
+
+// SetRemoteMuted sets Home Assistant's virtual mic mute — see muteController.
+// Returns whether it changed; a change is reported by the mute callback.
+func (s *Server) SetRemoteMuted(on bool) bool {
+	return s.mute.SetRemote(on)
+}
+
+// IsRemoteMuted reports HA's virtual mic mute alone.
+func (s *Server) IsRemoteMuted() bool {
+	return s.mute.IsRemoteMuted()
 }
 
 // CancelVolumeDisplay releases the volume arc's 2s hold on the ring so a

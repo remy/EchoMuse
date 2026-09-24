@@ -13,13 +13,18 @@ import (
 //
 // Only mute lives here: mute is device-sovereign (the physical button cannot
 // be overridden remotely, so the device must restore it itself, controller or
-// no controller). Volume is the opposite — the controller's stored
+// no controller). HA's remote mute rides alongside it, and never clears it. Volume is the opposite — the controller's stored
 // startupVolume is the source of truth, re-applied via SeedVolume on the
 // first config push each run.
 const statePath = "/data/local/etc/echomuse/state.json"
 
 type deviceState struct {
 	Muted bool `json:"muted"`
+	// RemoteMuted is Home Assistant's virtual mute. Persisted for the same
+	// reason as Muted: a reboot must not silently reopen a mic someone
+	// closed, and nothing else would restore it before the controller is
+	// reachable.
+	RemoteMuted bool `json:"remoteMuted,omitempty"`
 }
 
 // loadDeviceState reads the persisted state. ok=false means no usable state
