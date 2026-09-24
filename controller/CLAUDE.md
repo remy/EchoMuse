@@ -602,6 +602,23 @@ directions.
 - **Ambient Light** (`ListEntitiesSensorResponse` / `SensorStateResponse`,
   `ambient_light`) — lux. A device with no sensor sends `missing_state`, not
   0, because 0 lux is a real reading.
+- **Mute Microphone** (`ListEntitiesSwitchResponse` / `SwitchCommandRequest`,
+  key 4, `remote_mute`) — ON is muted, as on Voice PE. **HA's mute is
+  VIRTUAL and a second flag, never the button's**: `mute_set` stops the mic
+  stream and paints the red ring, and leaves the ADC and the button LED
+  alone. A remote unmute clears only what HA set, so a device muted at the
+  button stays muted — the button's mute being device-sovereign is the whole
+  reason it is a separate flag (Remy, 2026-09-24). The switch shows the
+  EFFECTIVE state, so turning it off over a button mute reads straight back
+  as on. A press of the button clears both. Persisted on the device in
+  `state.json`: a reboot must not silently reopen a mic someone closed.
+- **Media player mute** (`VOLUME_MUTE`, `speaker_mute`) — `speaker_mute_set`
+  zeroes the output at the ALSA write, after the chain and before the AEC and
+  meter taps, fading across one period each way. Both planes keep playing
+  silently, so unmuting resumes where the song has got to. A physical volume
+  press unmutes, since nothing on the device shows the mute; not persisted,
+  for the same reason. `VOLUME_MUTE` was advertised to every device with
+  `muted` hardcoded False until 2026-09-24 — a mute button that did nothing.
 
 ## Schema migrations
 

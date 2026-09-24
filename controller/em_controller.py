@@ -442,7 +442,9 @@ class Device:
 
         # Transient state — read by em_api._merge_device()
         self.speaking  = False
-        self.muted     = False
+        self.muted     = False   # effective: button OR Home Assistant
+        # Speaker mute (HA's media player mute), as the device last reported.
+        self.speaker_muted = False
         self.listening = False
         self.thinking  = False
 
@@ -4121,6 +4123,10 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             return not _d.cancel_event.is_set()
         async def _send_volume_set(level: int, _d=_device_ref) -> None:
             await _d.send_control({"type": "volume_set", "level": level})
+        async def _send_mic_mute(muted: bool, _d=_device_ref) -> None:
+            await _d.send_control({"type": "mute_set", "muted": muted})
+        async def _send_speaker_mute(muted: bool, _d=_device_ref) -> None:
+            await _d.send_control({"type": "speaker_mute_set", "muted": muted})
         async def _ring_alarm(_d=_device_ref) -> None:
             await start_timer_alarm(_d)
         async def _stop_alarm(_d=_device_ref) -> None:
@@ -4176,6 +4182,8 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             SERVER_HOST,
             standalone_play=_standalone_play,
             send_volume_set=_send_volume_set,
+            send_mic_mute=_send_mic_mute,
+            send_speaker_mute=_send_speaker_mute,
             ring_alarm=_ring_alarm,
             stop_alarm=_stop_alarm,
             start_conversation=_start_conversation,
@@ -4272,11 +4280,16 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                             device.cancel_event.set()
                             esphome.cancel_voice_turn(device_id, reason="muted")
                             await device.send_control({"type": "speaker_flush"})
+                        esphome.update_mic_mute(device_id, device.muted)
                         await api._push_event({
                             "type":      "device_update",
                             "device_id": device_id,
                             "state":     {"muted": device.muted},
                         })
+
+                    elif msg_type == "speaker_mute_state":
+                        device.speaker_muted = bool(msg.get("muted", False))
+                        esphome.update_speaker_mute(device_id, device.speaker_muted)
 
                     elif msg_type == "volume_state":
                         # Device reports its current volume level (raw tinymix index).

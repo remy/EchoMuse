@@ -246,6 +246,7 @@ MEDIA_PLAYER_KEY = 1
 # Append only.
 EVENT_KEY        = 2   # action-button hold, as an HA event entity
 AMBIENT_LUX_KEY  = 3   # TSL2540 ambient light, as an HA sensor
+MIC_MUTE_KEY     = 4   # HA's virtual mic mute, as a switch
 
 # Press types the event entity advertises. double/triple were parked because
 # detecting them means delaying the single press by the multi-tap window to
@@ -274,9 +275,12 @@ MEDIA_PLAYER_FEATURES = int(
     | MediaPlayerEntityFeature.PLAY_MEDIA
     | MediaPlayerEntityFeature.BROWSE_MEDIA
     | MediaPlayerEntityFeature.VOLUME_SET
-    | MediaPlayerEntityFeature.VOLUME_MUTE
     | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
 )
+# Added only for firmware announcing `speaker_mute`. It was advertised
+# unconditionally with `muted` hardcoded False and MUTE/UNMUTE unhandled — a
+# mute button in HA that did nothing.
+MEDIA_PLAYER_MUTE_FEATURE = int(MediaPlayerEntityFeature.VOLUME_MUTE)
 
 _MP_STATE = {
     "idle":    MediaPlayerState.IDLE,
@@ -528,6 +532,32 @@ class EchoMuseSatellite(SatelliteServerProtocol):
     def _ambient_lux_capable(self) -> bool:
         return self._device_has("ambient_light")
 
+    @property
+    def _remote_mute_capable(self) -> bool:
+        return self._device_has("remote_mute")
+
+    @property
+    def _speaker_mute_capable(self) -> bool:
+        return self._device_has("speaker_mute")
+
+    def _media_player_features(self) -> int:
+        flags = MEDIA_PLAYER_FEATURES
+        if self._speaker_mute_capable:
+            flags |= MEDIA_PLAYER_MUTE_FEATURE
+        return flags
+
+    @property
+    def _speaker_muted(self) -> bool:
+        srv = self._owning_server
+        return bool(srv is not None and srv.speaker_muted)
+
+    def _mic_mute_state_msg(self) -> "api_pb2.SwitchStateResponse":
+        srv = self._owning_server
+        return api_pb2.SwitchStateResponse(
+            key=MIC_MUTE_KEY,
+            state=bool(srv is not None and srv.mic_muted),
+        )
+
     def _voice_assistant_flags(self) -> int:
         """
         Feature flags for DeviceInfoResponse, gated on what the device has.
@@ -597,7 +627,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 # as the device name alone.
                 name="",
                 supports_pause=True,
-                feature_flags=MEDIA_PLAYER_FEATURES,
+                feature_flags=self._media_player_features(),
                 supported_formats=[
                     api_pb2.MediaPlayerSupportedFormat(
                         purpose=api_pb2.MEDIA_PLAYER_FORMAT_PURPOSE_DEFAULT,
@@ -634,6 +664,17 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     device_class="illuminance",
                     state_class=1,   # STATE_CLASS_MEASUREMENT
                 )
+            # Mic mute. ON is muted, as on Voice PE. It reports the device's
+            # EFFECTIVE state, so turning it off on a device muted at the
+            # button reads back as still on: HA's mute is virtual and can
+            # only clear what it set (device/internal/server/mute.go).
+            if self._remote_mute_capable:
+                yield api_pb2.ListEntitiesSwitchResponse(
+                    object_id="mute_microphone",
+                    key=MIC_MUTE_KEY,
+                    name="Mute Microphone",
+                    icon="mdi:microphone-off",
+                )
             yield api_pb2.ListEntitiesDoneResponse()
             return
 
@@ -641,6 +682,27 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                              api_pb2.SubscribeHomeAssistantStatesRequest)):
             log.debug(f"[{self._log_name}] {type(msg).__name__} from {self.peer}")
             yield self._media_state_msg()
+            if self._remote_mute_capable:
+                yield self._mic_mute_state_msg()
+            return
+
+        if isinstance(msg, api_pb2.SwitchCommandRequest):
+            send_fn = (self._owning_server._send_mic_mute
+                       if self._owning_server is not None else None)
+            if msg.key != MIC_MUTE_KEY or send_fn is None:
+                log.warning(
+                    f"[{self._log_name}] SwitchCommandRequest key={msg.key} "
+                    f"state={msg.state} dropped — "
+                    + ("unknown key" if msg.key != MIC_MUTE_KEY
+                       else "device not connected")
+                )
+                # Answer with what is true, so HA does not hold the new state.
+                yield self._mic_mute_state_msg()
+                return
+            log.info(f"[{self._log_name}] HA mic mute → {msg.state}")
+            # The device answers with mute_state, which is what updates HA.
+            asyncio.create_task(send_fn(bool(msg.state)))
+            yield _HANDLED
             return
 
         if isinstance(msg, api_pb2.SubscribeVoiceAssistantRequest):
@@ -739,6 +801,14 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     asyncio.create_task(em_player.resume(device_id))
                 elif cmd == api_pb2.MEDIA_PLAYER_COMMAND_STOP:
                     asyncio.create_task(em_player.stop(device_id))
+                elif cmd in (api_pb2.MEDIA_PLAYER_COMMAND_MUTE,
+                             api_pb2.MEDIA_PLAYER_COMMAND_UNMUTE):
+                    send_fn = self._owning_server._send_speaker_mute
+                    if send_fn is not None:
+                        asyncio.create_task(
+                            send_fn(cmd == api_pb2.MEDIA_PLAYER_COMMAND_MUTE))
+                    else:
+                        log.warning(f"[{self._log_name}] speaker mute requested but device not connected")
                 else:
                     log.debug(
                         f"[{self._log_name}] MediaPlayerCommandRequest: "
@@ -751,7 +821,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                     key=MEDIA_PLAYER_KEY,
                     state=MediaPlayerState.PLAYING,
                     volume=self._current_volume,
-                    muted=False,
+                    muted=self._speaker_muted,
                 )
             else:
                 yield self._media_state_msg()
@@ -870,7 +940,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
                 key=MEDIA_PLAYER_KEY,
                 state=MediaPlayerState.PLAYING,
                 volume=self._current_volume,
-                muted=False,
+                muted=self._speaker_muted,
             )
             return
 
@@ -1132,7 +1202,7 @@ class EchoMuseSatellite(SatelliteServerProtocol):
             key=MEDIA_PLAYER_KEY,
             state=st,
             volume=self._current_volume,
-            muted=False,
+            muted=self._speaker_muted,
         )
 
     def _announce_play_cb(self):
@@ -2411,6 +2481,13 @@ class DeviceESPhomeServer:
         # sends a volume_set control-plane message to the physical device.
         # None when no device is connected.
         self._send_volume_set = None
+        # Injected by device_connected() — async callable(muted: bool) each,
+        # sending mute_set / speaker_mute_set. None when no device is
+        # connected. The states below are the device's last reports.
+        self._send_mic_mute = None
+        self._send_speaker_mute = None
+        self.mic_muted: bool = False
+        self.speaker_muted: bool = False
         # Injected by device_connected() — the timer-alarm orchestrator. It
         # lives in em_controller because ringing drives the device speaker,
         # mic and LEDs (all Device state em_esphome cannot reach). async
@@ -3179,6 +3256,8 @@ async def device_connected(
     ring_alarm=None,
     stop_alarm=None,
     start_conversation=None,
+    send_mic_mute=None,
+    send_speaker_mute=None,
 ) -> None:
     """
     Called by em_controller.handle_control() when an Echo Dot connects.
@@ -3205,6 +3284,9 @@ async def device_connected(
     word, for HA's announce-then-listen (`assist_satellite.start_conversation`
     and `ask_question`). Same reasoning: it drives the mic, the ring and the
     voice lock.
+
+    send_mic_mute / send_speaker_mute: async callable(muted: bool) — send
+    mute_set / speaker_mute_set, for the HA mic switch and media player mute.
     """
     server = _servers.get(device_id)
     if server is None:
@@ -3221,6 +3303,8 @@ async def device_connected(
         server = await _register_device_server(device_id, row["label"])
     server._standalone_play = standalone_play
     server._send_volume_set = send_volume_set
+    server._send_mic_mute = send_mic_mute
+    server._send_speaker_mute = send_speaker_mute
     server._ring_alarm = ring_alarm
     server._stop_alarm = stop_alarm
     server._start_conversation = start_conversation
@@ -3246,6 +3330,8 @@ async def device_disconnected(device_id: str) -> None:
         log.debug(f"[esphome.{device_id[-8:]}] device_disconnected: port already down")
         return
     server._send_volume_set = None
+    server._send_mic_mute = None
+    server._send_speaker_mute = None
     # The device is gone — a ring cannot reach it and its Device state is torn
     # down, so drop any live timers rather than firing the orchestrator against
     # a disconnected device. em_controller stops the ring task on its own side.
@@ -3380,6 +3466,31 @@ def update_ambient_lux(device_id: str, lux) -> None:
         state=float(lux) if lux is not None else 0.0,
         missing_state=lux is None,
     ))
+
+
+def update_mic_mute(device_id: str, muted: bool) -> None:
+    """
+    Push the device's mic mute to HA's switch. `muted` is the EFFECTIVE state
+    (button or remote), which is what the switch shows.
+    """
+    server = _servers.get(device_id)
+    if server is None:
+        return
+    server.mic_muted = bool(muted)
+    satellite = server.get_satellite()
+    if satellite is not None and satellite._remote_mute_capable:
+        satellite._send_one(satellite._mic_mute_state_msg())
+
+
+def update_speaker_mute(device_id: str, muted: bool) -> None:
+    """Push the device's speaker mute to HA's media player."""
+    server = _servers.get(device_id)
+    if server is None:
+        return
+    server.speaker_muted = bool(muted)
+    satellite = server.get_satellite()
+    if satellite is not None:
+        satellite._send_one(satellite._media_state_msg())
 
 
 def update_device_volume(device_id: str, volume: float) -> None:
